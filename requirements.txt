@@ -1,0 +1,10 @@
+websockets==10.4
+pyaudio
+numpy
+soundfile
+librosa
+webrtcvad
+resemblyzer
+pyannote.metrics
+python-dotenv
+rich
