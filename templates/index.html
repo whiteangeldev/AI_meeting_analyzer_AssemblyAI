@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Caption - Meeting Analyzer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎤 Live Caption</h1>
+            <div class="controls">
+                <button id="startBtn" class="btn btn-start">
+                    <span class="btn-icon">▶</span>
+                    Start Recording
+                </button>
+                <button id="stopBtn" class="btn btn-stop" disabled>
+                    <span class="btn-icon">⏹</span>
+                    Stop Recording
+                </button>
+                <div class="status-indicator">
+                    <span id="statusDot" class="dot"></span>
+                    <span id="statusText">Ready</span>
+                </div>
+            </div>
+        </header>
+
+        <main>
+            <div class="transcription-container">
+                <div id="transcriptionArea" class="transcription-area">
+                    <div class="welcome-message">
+                        <p>Click "Start Recording" to begin live transcription</p>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <div class="stats">
+                <div class="stat-item">
+                    <span class="stat-label">Speakers:</span>
+                    <span id="speakerCount" class="stat-value">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Lines:</span>
+                    <span id="lineCount" class="stat-value">0</span>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
+

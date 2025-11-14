@@ -8,3 +8,5 @@ resemblyzer
 pyannote.metrics
 python-dotenv
 rich
+flask
+flask-socketio
