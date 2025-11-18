@@ -68,6 +68,55 @@ header h1 {
     flex-wrap: wrap;
 }
 
+.audio-mode-selector {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--bg-primary);
+    border-radius: 10px;
+    border: 1px solid var(--border);
+}
+
+.audio-mode-icon {
+    font-size: 18px;
+}
+
+.audio-mode-selector label {
+    font-size: 14px;
+    color: var(--text-secondary);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.audio-mode-select {
+    padding: 10px 16px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    outline: none;
+}
+
+.audio-mode-select:hover:not(:disabled) {
+    border-color: var(--accent-primary);
+    background: var(--bg-tertiary);
+}
+
+.audio-mode-select:focus {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+}
+
+.audio-mode-select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 .btn {
     padding: 12px 24px;
     border: none;

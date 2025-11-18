@@ -12,6 +12,14 @@
         <header>
             <h1>🎤 Live Caption</h1>
             <div class="controls">
+                <div class="audio-mode-selector">
+                    <span class="audio-mode-icon">🔊</span>
+                    <label for="audioMode">Audio Source:</label>
+                    <select id="audioMode" class="audio-mode-select">
+                        <option value="microphone">🎤 Microphone</option>
+                        <option value="system">💻 System Audio</option>
+                    </select>
+                </div>
                 <button id="startBtn" class="btn btn-start">
                     <span class="btn-icon">▶</span>
                     Start Recording
