@@ -4,3 +4,5 @@ numpy
 python-dotenv
 flask
 flask-socketio
+resemblyzer
+scipy

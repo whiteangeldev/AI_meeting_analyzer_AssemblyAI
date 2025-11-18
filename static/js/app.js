@@ -140,9 +140,26 @@ startBtn.addEventListener("click", () => {
 stopBtn.addEventListener("click", () => {
   socket.emit("stop_recording");
   updateStatus("ready", "Stopped");
+  
+  // Remove generic partial line
   if (currentPartialLine) {
     currentPartialLine.remove();
     currentPartialLine = null;
+  }
+  
+  // Finalize any active block (convert grey to green)
+  if (currentActiveBlock) {
+    currentActiveBlock.classList.remove("partial");
+    currentActiveBlock.classList.add("final");
+    let timestampEl = currentActiveBlock.querySelector(".timestamp");
+    if (!timestampEl) {
+      timestampEl = document.createElement("div");
+      timestampEl.className = "timestamp";
+      currentActiveBlock.appendChild(timestampEl);
+    }
+    timestampEl.textContent = new Date().toLocaleTimeString();
+    currentActiveBlock = null;
+    activeBlockSpeaker = null;
   }
 });
 
