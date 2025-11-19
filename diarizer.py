@@ -1,228 +1,109 @@
+# diarizer.py
+
 import numpy as np
-from scipy.spatial.distance import cdist
-from config import SAMPLE_RATE, MIN_AUDIO_SECS
+from resemblyzer import VoiceEncoder
+from scipy.spatial.distance import cosine
 
 
-class SpeakerDiarizer:
-    """Lightweight speaker diarization with speaker merging and stability"""
+class OnlineDiarizer:
+    """
+    Lightweight real-time diarizer:
+    - Uses short waveform windows (≈1–1.2s)
+    - Maintains speaker centroids
+    - Returns stable labels: User1, User2, ...
+    - Caps number of speakers (default 2) to avoid User3/User4 noise
+    """
 
-    def __init__(self, similarity_threshold=0.75, merge_threshold=0.85):
+    def __init__(
+        self, sample_rate: int, threshold: float = 0.72, max_speakers: int = 2
+    ):
+        self.sample_rate = sample_rate
+        self.encoder = VoiceEncoder("cpu")
+        print("Diarizer initialized (Resemblyzer on CPU)")
+
+        self.threshold = threshold
+        self.max_speakers = max_speakers
+
+        # { "User1": centroid_embedding, ... }
+        self.speakers: dict[str, np.ndarray] = {}
+        self.next_id = 1
+
+    # ------------- internal helpers -------------
+
+    def _new_speaker_label(self) -> str:
+        label = f"User{self.next_id}"
+        self.next_id += 1
+        return label
+
+    def _best_match(self, emb: np.ndarray):
         """
-        Initialize diarizer
-
-        Args:
-            similarity_threshold: Minimum similarity to match existing speaker (0.75 = 75%)
-            merge_threshold: Similarity threshold to merge speakers (0.85 = 85%)
+        Return (best_label, best_similarity) or (None, -inf) if no speakers yet.
         """
-        try:
-            from resemblyzer import VoiceEncoder
+        if not self.speakers:
+            return None, float("-inf")
 
-            self.encoder = VoiceEncoder()
-        except ImportError:
-            raise ImportError("resemblyzer not installed. Run: pip install resemblyzer")
+        best_label = None
+        best_sim = float("-inf")
 
-        self.similarity_threshold = similarity_threshold
-        self.merge_threshold = merge_threshold
-        self.speakers = []  # List of speaker labels: ["User1", "User2", ...]
-        self.embeddings = []  # List of speaker embeddings (centroids)
-        self.speaker_count = 0
-        self.max_speakers = 2  # Expecting up to 2 speakers (e.g., dialogue)
-        self.assignment_count = 0
-        self.new_speaker_threshold = (
-            0.68  # If similarity < 0.68, create new speaker (more sensitive)
-        )
+        for label, centroid in self.speakers.items():
+            sim = 1.0 - cosine(centroid, emb)
+            if sim > best_sim:
+                best_sim = sim
+                best_label = label
 
-    def reset(self):
-        """Reset diarizer for new session"""
-        self.speakers = []
-        self.embeddings = []
-        self.speaker_count = 0
-        self.assignment_count = 0
+        return best_label, best_sim
 
-    def _merge_similar_speakers(self):
-        """Merge speakers that are very similar (likely same person)"""
-        if len(self.speakers) < 2:
-            return
-
-        # Check all pairs for high similarity
-        merged = set()
-        for i in range(len(self.speakers)):
-            if i in merged:
-                continue
-            for j in range(i + 1, len(self.speakers)):
-                if j in merged:
-                    continue
-
-                # Calculate similarity between speakers
-                sim = np.dot(self.embeddings[i], self.embeddings[j])
-
-                # Lower merge threshold to merge more aggressively (0.80 for very aggressive merging)
-                if sim >= 0.80:
-                    # Merge j into i
-                    # Average embeddings
-                    self.embeddings[i] = (
-                        0.6 * self.embeddings[i] + 0.4 * self.embeddings[j]
-                    )
-                    self.embeddings[i] /= np.linalg.norm(self.embeddings[i]) + 1e-9
-
-                    # Remove j
-                    merged.add(j)
-                    print(
-                        f"🔀 Merged {self.speakers[j]} into {self.speakers[i]} (similarity: {sim:.3f})"
-                    )
-
-        # Remove merged speakers (in reverse order to maintain indices)
-        for idx in sorted(merged, reverse=True):
-            self.speakers.pop(idx)
-            self.embeddings.pop(idx)
-
-    def assign(self, audio_f32: np.ndarray, sr=SAMPLE_RATE) -> str:
+    def _update_centroid(self, label: str, emb: np.ndarray, alpha: float = 0.2):
         """
-        Assign speaker label to audio segment
-
-        Args:
-            audio_f32: Audio samples as float32 array
-            sr: Sample rate (default 16000)
-
-        Returns:
-            Speaker label: "User1", "User2", etc.
+        Exponential moving average update of speaker centroid.
         """
-        # Check minimum audio length
-        min_samples = int(sr * MIN_AUDIO_SECS)
-        if audio_f32 is None or len(audio_f32) < min_samples:
+        old = self.speakers[label]
+        new = alpha * emb + (1.0 - alpha) * old
+        new /= np.linalg.norm(new) + 1e-9
+        self.speakers[label] = new
+
+    # ------------- public API -------------
+
+    def diarize(self, waveform: np.ndarray) -> str | None:
+        """
+        Main entry point: given a waveform (1D numpy array),
+        returns a label like 'User1', 'User2', ... or None if too short.
+        Called on short windows (≈1.0–1.2s).
+        """
+
+        if waveform is None or len(waveform) < 0.4 * self.sample_rate:
+            # Very short → skip
             return None
 
-        # Generate embedding
-        emb = self.encoder.embed_utterance(audio_f32.astype(np.float32))
-        emb = emb / (np.linalg.norm(emb) + 1e-9)  # Normalize
+        # Ensure float32 mono
+        wav = waveform.astype(np.float32)
 
-        # First speaker
+        # Embed utterance (Resemblyzer handles variable length)
+        emb = self.encoder.embed_utterance(wav)
+        emb = emb / (np.linalg.norm(emb) + 1e-9)
+
+        # Case 1: no speakers yet → create User1
         if not self.speakers:
-            self.speaker_count = 1
-            label = f"User{self.speaker_count}"
-            self.speakers.append(label)
-            self.embeddings.append(emb)
-            self.assignment_count += 1
-            print(f"🎤 First speaker detected: {label}")
+            label = self._new_speaker_label()
+            self.speakers[label] = emb
+            print(f"🆕 Registered speaker: {label}")
             return label
 
-        # Compare with existing speakers
-        embeddings_array = np.array(self.embeddings)
-        similarities = 1.0 - cdist([emb], embeddings_array, metric="cosine")[0]
-        max_similarity = similarities.max()
-        best_match_idx = similarities.argmax()
+        # Case 2: have speakers → find best match
+        best_label, best_sim = self._best_match(emb)
 
-        # Log similarities for debugging
-        sim_details = [
-            f"{self.speakers[i]}: {sim:.3f}" for i, sim in enumerate(similarities)
-        ]
-        print(
-            f"📊 Similarities: {', '.join(sim_details)} | Max: {max_similarity:.3f} with {self.speakers[best_match_idx]}"
-        )
+        # If we already reached max_speakers → always reuse best match
+        if len(self.speakers) >= self.max_speakers:
+            self._update_centroid(best_label, emb)
+            return best_label
 
-        # If similarity is VERY high (>= 0.75), assign to existing speaker
-        # This requires high confidence that it's the same person
-        if max_similarity >= self.similarity_threshold:
-            # Update centroid with exponential moving average
-            alpha = 0.90  # Allow some adaptation
-            self.embeddings[best_match_idx] = (
-                alpha * self.embeddings[best_match_idx] + (1 - alpha) * emb
-            )
-            self.embeddings[best_match_idx] /= (
-                np.linalg.norm(self.embeddings[best_match_idx]) + 1e-9
-            )
-            self.assignment_count += 1
-            print(
-                f"✓ High confidence: Assigned to {self.speakers[best_match_idx]} (similarity: {max_similarity:.3f})"
-            )
+        # If best match is good enough → reuse that speaker
+        if best_sim >= self.threshold:
+            self._update_centroid(best_label, emb)
+            return best_label
 
-            # Merge similar speakers periodically (every 5 assignments) - more frequent merging
-            if self.assignment_count % 5 == 0:
-                self._merge_similar_speakers()
-                # After merging, check if best_match_idx is still valid
-                if best_match_idx < len(self.speakers):
-                    return self.speakers[best_match_idx]
-                else:
-                    return self.speakers[0] if self.speakers else "User1"
-
-            return self.speakers[best_match_idx]
-
-        # Check if similarity is low enough to warrant new speaker
-        # For man/woman, similarity is typically 0.5-0.7
-        # If similarity < 0.68, likely different speaker - create new one
-        if max_similarity < self.new_speaker_threshold:
-            # Low similarity - create new speaker (if we still have room)
-            if self.speaker_count < self.max_speakers:
-                self.speaker_count += 1
-                label = f"User{self.speaker_count}"
-                self.speakers.append(label)
-                self.embeddings.append(emb)
-                self.assignment_count += 1
-                print(
-                    f"🎤 NEW SPEAKER DETECTED: {label} (similarity to closest: {max_similarity:.3f})"
-                )
-
-                # Merge periodically (every 5 assignments)
-                if self.assignment_count % 5 == 0:
-                    self._merge_similar_speakers()
-
-                return label
-            else:
-                print(
-                    f"⚠ Max speakers ({self.max_speakers}) reached - assigning to closest match {self.speakers[best_match_idx]} (similarity: {max_similarity:.3f})"
-                )
-                return self.speakers[best_match_idx]
-
-        # Moderate similarity (0.68 - 0.75) - ambiguous zone
-        # For different speakers, this range is common (man/woman typically 0.65-0.72)
-        # Be more aggressive about creating new speakers in this range
-        if len(similarities) > 1:
-            sorted_sims = np.sort(similarities)[::-1]
-            second_best = sorted_sims[1] if len(sorted_sims) > 1 else 0
-            diff = max_similarity - second_best
-
-            # If difference is small (< 0.15) OR similarity is in ambiguous zone (< 0.72), prefer new speaker
-            # This catches cases where similarity is 0.68-0.72 (likely different speaker)
-            if (diff < 0.15) or (max_similarity < 0.72):
-                if self.speaker_count < self.max_speakers:
-                    self.speaker_count += 1
-                    label = f"User{self.speaker_count}"
-                    self.speakers.append(label)
-                    self.embeddings.append(emb)
-                    self.assignment_count += 1
-                    print(
-                        f"🎤 NEW SPEAKER (ambiguous zone): {label} (max: {max_similarity:.3f}, 2nd: {second_best:.3f}, diff: {diff:.3f})"
-                    )
-
-                    if self.assignment_count % 5 == 0:
-                        self._merge_similar_speakers()
-
-                    return label
-                else:
-                    print(
-                        f"⚠ Ambiguous zone but max speakers reached - assigning to {self.speakers[best_match_idx]}"
-                    )
-                    return self.speakers[best_match_idx]
-
-        # If similarity is 0.72-0.75 and second best is clearly lower, assign to best match
-        # This is the only moderate case where we match (very close to threshold)
-        alpha = 0.90
-        self.embeddings[best_match_idx] = (
-            alpha * self.embeddings[best_match_idx] + (1 - alpha) * emb
-        )
-        self.embeddings[best_match_idx] /= (
-            np.linalg.norm(self.embeddings[best_match_idx]) + 1e-9
-        )
-        self.assignment_count += 1
-        print(
-            f"⚠ Moderate confidence (edge case): Assigned to {self.speakers[best_match_idx]} (similarity: {max_similarity:.3f})"
-        )
-
-        if self.assignment_count % 5 == 0:
-            self._merge_similar_speakers()
-            if best_match_idx < len(self.speakers):
-                return self.speakers[best_match_idx]
-            else:
-                return self.speakers[0] if self.speakers else "User1"
-
-        return self.speakers[best_match_idx]
+        # Otherwise, create a new speaker (within max_speakers limit)
+        label = self._new_speaker_label()
+        self.speakers[label] = emb
+        print(f"🆕 Registered speaker: {label} (sim={best_sim:.3f}, below threshold)")
+        return label
