@@ -54,6 +54,10 @@ socket.on("transcription", (data) => {
   handleTranscription(data);
 });
 
+socket.on("partial_update", (data) => {
+  handlePartialUpdate(data);
+});
+
 socket.on("error", (data) => {
   console.error("Error:", data.message);
   // Show a more user-friendly error message
@@ -162,6 +166,39 @@ function updateUI() {
     audioModeSelect.disabled = isRecording; // Disable mode selection during recording
 }
 
+function handlePartialUpdate(data) {
+  const { speaker, text } = data;
+  
+  // If text is empty, clear the partial window
+  if (!text || !text.trim()) {
+    if (currentPartialLine) {
+      currentPartialLine.remove();
+      currentPartialLine = null;
+    }
+    return;
+  }
+  
+  // Update or create partial line
+  if (currentPartialLine) {
+    // Update existing partial line
+    const textEl = currentPartialLine.querySelector(".transcription-text");
+    const speakerEl = currentPartialLine.querySelector(".speaker-label");
+    if (textEl) {
+      textEl.textContent = text;
+    }
+    if (speakerEl && speaker) {
+      speakerEl.textContent = speaker;
+    }
+  } else {
+    // Create new partial line
+    currentPartialLine = createTranscriptionLine(speaker || "Speaker", text, true);
+    transcriptionArea.appendChild(currentPartialLine);
+  }
+  
+  // Auto-scroll to show the partial update
+  transcriptionArea.scrollTop = transcriptionArea.scrollHeight;
+}
+
 function handleTranscription(data) {
   const { speaker, text, is_partial, timestamp } = data;
   console.log("Received transcription:", {
@@ -222,13 +259,10 @@ function handleTranscription(data) {
     }
   } else {
     // Final transcription - this is a complete finalized block from a speaker
-    // Remove partial lines and finalize active block
+    // Remove partial line when final arrives
     if (currentPartialLine) {
-      const partialSpeaker = currentPartialLine.querySelector(".speaker-label");
-      if (partialSpeaker && partialSpeaker.textContent === "...") {
-        currentPartialLine.remove();
-        currentPartialLine = null;
-      }
+      currentPartialLine.remove();
+      currentPartialLine = null;
     }
 
     // Final block - convert active block to finalized or create new finalized block
