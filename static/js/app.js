@@ -27,6 +27,12 @@ let lineCount = 0;
 let currentPartialLine = null;
 let currentActiveBlock = null; // Track the currently active block (being updated)
 let activeBlockSpeaker = null; // Track the speaker of the active block
+let lastFinalBlock = null;
+let lastFinalSpeaker = null;
+let lastFinalTimestamp = 0;
+const MERGE_WINDOW_MS = 6000;
+const MERGE_MAX_CHARS = 140;
+const MERGE_MAX_SENTENCE_PUNCT = 1;
 
 // Socket event handlers
 socket.on("connect", () => {
@@ -62,10 +68,10 @@ socket.on("error", (data) => {
   console.error("Error:", data.message);
   // Show a more user-friendly error message
   const errorMsg = data.message || "An unknown error occurred";
-  
+
   // Format multi-line error messages better
   const formattedMsg = errorMsg.replace(/\n/g, "\n\n");
-  
+
   alert("Error: " + formattedMsg);
   updateStatus("ready", "Error occurred");
   updateUI();
@@ -75,7 +81,7 @@ socket.on("error", (data) => {
 socket.on("speaker_alert", (data) => {
   const { message, from_speaker, to_speaker, type } = data;
   console.log("🔊 Speaker Alert:", message);
-  
+
   // Create a visible alert banner at the top of the page
   const alertDiv = document.createElement("div");
   alertDiv.style.cssText = `
@@ -94,7 +100,7 @@ socket.on("speaker_alert", (data) => {
     animation: slideDown 0.3s ease-out;
   `;
   alertDiv.textContent = message;
-  
+
   // Add animation style if not exists
   if (!document.getElementById("speaker-alert-style")) {
     const style = document.createElement("style");
@@ -113,9 +119,9 @@ socket.on("speaker_alert", (data) => {
     `;
     document.head.appendChild(style);
   }
-  
+
   document.body.appendChild(alertDiv);
-  
+
   // Remove alert after 3 seconds
   setTimeout(() => {
     alertDiv.style.animation = "slideDown 0.3s ease-out reverse";
@@ -129,28 +135,31 @@ socket.on("speaker_alert", (data) => {
 
 // Button event handlers
 startBtn.addEventListener("click", () => {
-    const audioMode = audioModeSelect.value; // Get selected audio mode
-    socket.emit("start_recording", { audio_mode: audioMode });
-    updateStatus("recording", "Recording...");
-    transcriptionArea.innerHTML = ""; // Clear previous transcriptions
-    speakers.clear();
-    lineCount = 0;
-    currentActiveBlock = null; // Reset active block tracking
-    activeBlockSpeaker = null; // Reset active speaker
-    currentPartialLine = null; // Reset partial line
-    updateStats();
+  const audioMode = audioModeSelect.value; // Get selected audio mode
+  socket.emit("start_recording", { audio_mode: audioMode });
+  updateStatus("recording", "Recording...");
+  transcriptionArea.innerHTML = ""; // Clear previous transcriptions
+  speakers.clear();
+  lineCount = 0;
+  currentActiveBlock = null; // Reset active block tracking
+  activeBlockSpeaker = null; // Reset active speaker
+  currentPartialLine = null; // Reset partial line
+  lastFinalBlock = null;
+  lastFinalSpeaker = null;
+  lastFinalTimestamp = 0;
+  updateStats();
 });
 
 stopBtn.addEventListener("click", () => {
   socket.emit("stop_recording");
   updateStatus("ready", "Stopped");
-  
+
   // Remove generic partial line
   if (currentPartialLine) {
     currentPartialLine.remove();
     currentPartialLine = null;
   }
-  
+
   // Finalize any active block (convert grey to green)
   if (currentActiveBlock) {
     currentActiveBlock.classList.remove("partial");
@@ -178,14 +187,14 @@ function updateStatus(state, text) {
 }
 
 function updateUI() {
-    startBtn.disabled = isRecording;
-    stopBtn.disabled = !isRecording;
-    audioModeSelect.disabled = isRecording; // Disable mode selection during recording
+  startBtn.disabled = isRecording;
+  stopBtn.disabled = !isRecording;
+  audioModeSelect.disabled = isRecording; // Disable mode selection during recording
 }
 
 function handlePartialUpdate(data) {
   const { speaker, text } = data;
-  
+
   // If text is empty, clear the partial window
   if (!text || !text.trim()) {
     if (currentPartialLine) {
@@ -194,7 +203,7 @@ function handlePartialUpdate(data) {
     }
     return;
   }
-  
+
   // Update or create partial line
   if (currentPartialLine) {
     // Update existing partial line
@@ -208,12 +217,58 @@ function handlePartialUpdate(data) {
     }
   } else {
     // Create new partial line
-    currentPartialLine = createTranscriptionLine(speaker || "Speaker", text, true);
+    currentPartialLine = createTranscriptionLine(
+      speaker || "Speaker",
+      text,
+      true
+    );
     transcriptionArea.appendChild(currentPartialLine);
   }
-  
+
   // Auto-scroll to show the partial update
   transcriptionArea.scrollTop = transcriptionArea.scrollHeight;
+}
+
+function maybeMergeWithLastFinal(speaker, text) {
+  if (!lastFinalBlock || !speaker || !text) {
+    return false;
+  }
+
+  if (speaker !== lastFinalSpeaker) {
+    return false;
+  }
+
+  const now = Date.now();
+  if (now - lastFinalTimestamp > MERGE_WINDOW_MS) {
+    return false;
+  }
+
+  const trimmedNew = text.trim();
+  if (
+    !trimmedNew ||
+    trimmedNew.length > MERGE_MAX_CHARS ||
+    (trimmedNew.match(/[.!?]/g) || []).length > MERGE_MAX_SENTENCE_PUNCT
+  ) {
+    return false;
+  }
+
+  const textEl = lastFinalBlock.querySelector(".transcription-text");
+  if (!textEl) {
+    return false;
+  }
+
+  const existing = textEl.textContent.trim();
+  const needsSpace =
+    existing.length === 0 ? "" : /[.!?\u2014]$/.test(existing) ? " " : ". ";
+  textEl.textContent = `${existing}${needsSpace}${trimmedNew}`.trim();
+
+  const timestampEl = lastFinalBlock.querySelector(".timestamp");
+  if (timestampEl) {
+    timestampEl.textContent = new Date().toLocaleTimeString();
+  }
+
+  lastFinalTimestamp = now;
+  return true;
 }
 
 function handleTranscription(data) {
@@ -244,7 +299,8 @@ function handleTranscription(data) {
       if (
         currentActiveBlock &&
         activeBlockSpeaker === speaker &&
-        currentActiveBlock.querySelector(".speaker-label").textContent === speaker
+        currentActiveBlock.querySelector(".speaker-label").textContent ===
+          speaker
       ) {
         // Update existing active block
         const textEl = currentActiveBlock.querySelector(".transcription-text");
@@ -257,19 +313,19 @@ function handleTranscription(data) {
           currentPartialLine.remove();
           currentPartialLine = null;
         }
-        
+
         // Create new active block for this speaker
         const line = createTranscriptionLine(speaker, text, true);
         transcriptionArea.appendChild(line);
         currentActiveBlock = line;
         activeBlockSpeaker = speaker;
-        
+
         // Track speaker
         if (!speakers.has(speaker)) {
           speakers.add(speaker);
           updateStats();
         }
-        
+
         // Auto-scroll
         transcriptionArea.scrollTop = transcriptionArea.scrollHeight;
       }
@@ -284,18 +340,20 @@ function handleTranscription(data) {
 
     // Final block - convert active block to finalized or create new finalized block
     if (speaker && text) {
+      const now = Date.now();
       // Check if this finalizes the current active block (same speaker)
       if (
         currentActiveBlock &&
         activeBlockSpeaker === speaker &&
-        currentActiveBlock.querySelector(".speaker-label").textContent === speaker
+        currentActiveBlock.querySelector(".speaker-label").textContent ===
+          speaker
       ) {
         // Finalize the current active block - convert it to a finalized block
         const textEl = currentActiveBlock.querySelector(".transcription-text");
         if (textEl) {
           textEl.textContent = text;
         }
-        
+
         // Add timestamp if not present
         let timestampEl = currentActiveBlock.querySelector(".timestamp");
         if (!timestampEl) {
@@ -304,19 +362,27 @@ function handleTranscription(data) {
           currentActiveBlock.appendChild(timestampEl);
         }
         timestampEl.textContent = new Date().toLocaleTimeString();
-        
+
         // Remove partial class, add final class
         currentActiveBlock.classList.remove("partial");
         currentActiveBlock.classList.add("final");
-        
+
         // Finalize this block - it's no longer active (will be replaced if same speaker continues)
+        const finalizedBlock = currentActiveBlock;
         currentActiveBlock = null;
         activeBlockSpeaker = null;
+        lastFinalBlock = finalizedBlock;
+        lastFinalSpeaker = speaker;
+        lastFinalTimestamp = now;
+        transcriptionArea.scrollTop = transcriptionArea.scrollHeight;
+        return;
       } else {
         // Different speaker or no active block - create a new finalized block
         // Previous active block is already finalized (if any)
         if (currentActiveBlock) {
           // Convert previous active block to finalized
+          const previousBlock = currentActiveBlock;
+          const previousSpeaker = activeBlockSpeaker;
           currentActiveBlock.classList.remove("partial");
           currentActiveBlock.classList.add("final");
           let timestampEl = currentActiveBlock.querySelector(".timestamp");
@@ -328,6 +394,14 @@ function handleTranscription(data) {
           timestampEl.textContent = new Date().toLocaleTimeString();
           currentActiveBlock = null;
           activeBlockSpeaker = null;
+          lastFinalBlock = previousBlock;
+          lastFinalSpeaker = previousSpeaker;
+          lastFinalTimestamp = now;
+        }
+
+        if (maybeMergeWithLastFinal(speaker, text)) {
+          transcriptionArea.scrollTop = transcriptionArea.scrollHeight;
+          return;
         }
 
         // Create new finalized block for this speaker turn
@@ -340,6 +414,10 @@ function handleTranscription(data) {
         }
         lineCount++;
         updateStats();
+
+        lastFinalBlock = line;
+        lastFinalSpeaker = speaker;
+        lastFinalTimestamp = Date.now();
       }
 
       // Auto-scroll to bottom

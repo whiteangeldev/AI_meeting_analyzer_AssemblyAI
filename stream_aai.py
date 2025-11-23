@@ -14,6 +14,7 @@ PARAMS = {
     "sample_rate": str(SAMPLE_RATE),
     "format_turns": "true",
     "speech_model": "universal-streaming-english",
+    "speaker_labels": "true",  # Enable speaker diarization
 }
 AAI_WS_URL = f"wss://streaming.assemblyai.com/v3/ws?{urllib.parse.urlencode(PARAMS)}"
 
