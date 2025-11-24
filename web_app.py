@@ -47,10 +47,15 @@ processed_final_transcripts = (
     set()
 )  # Track processed final transcripts to avoid duplicate diarization
 
+# Track last emitted speaker for boundary correction across transcripts
+last_emitted_speaker_global = None
+last_emitted_text_global = None
+
 # diarizer: real-time speaker id
-# Lower threshold (0.65) for better User2 detection, relaxed update_guard (0.08) for learning
+# Higher threshold (0.72) for stricter matching - makes it easier to register new speakers
+# With 5 speakers, we need strict matching to avoid false matches
 diarizer = OnlineDiarizer(
-    sample_rate=SAMPLE_RATE, threshold=0.65, max_speakers=2, update_guard=0.08
+    sample_rate=SAMPLE_RATE, threshold=0.72, max_speakers=5, update_guard=0.08
 )
 
 # AssemblyAI speaker label mapping (API -> UI-friendly "UserX")
@@ -536,6 +541,7 @@ async def transcription_worker(audio_mode="microphone"):
                 - "end_of_turn": Boolean indicating if this is a final transcript
         """
         global is_recording, ring, diarizer, processed_final_transcripts
+        global last_emitted_speaker_global, last_emitted_text_global
         if not is_recording:
             return
 
@@ -561,7 +567,7 @@ async def transcription_worker(audio_mode="microphone"):
             normalized = normalize_text(transcript)
             transcript_hash = hashlib.md5(normalized.encode()).hexdigest()
             if transcript_hash in processed_final_transcripts:
-                print(f"ℹ️  Skipping duplicate final transcript: {transcript[:50]}...")
+                print(f"ℹ️  Skipping duplicate final transcript: {transcript[:100]}...")
                 return  # Already processed this exact final transcript
             processed_final_transcripts.add(transcript_hash)
             # Keep set size bounded
@@ -627,8 +633,14 @@ async def transcription_worker(audio_mode="microphone"):
 
             print(f"🔀 Detected {len(segments)} speaker segments in transcript")
 
+            # Track previous segment for merging
+            prev_seg_text = None
+            prev_seg_speaker = None
+
             # Process each segment separately
-            for seg_start, seg_end, speaker_id_or_label in segments:
+            for seg_idx, (seg_start, seg_end, speaker_id_or_label) in enumerate(
+                segments
+            ):
                 # Extract the words that belong to this segment
                 seg_words = words[seg_start:seg_end]
                 # Reconstruct the text for this segment
@@ -652,6 +664,63 @@ async def transcription_worker(audio_mode="microphone"):
                         if speaker_id_or_label
                         else None
                     )
+
+                # Step 1.5: Verify short boundary segments with Resemblyzer and merge if needed
+                # AssemblyAI sometimes mis-assigns speaker tags at boundaries, especially for short segments.
+                # If a segment is very short (1-4 words) at the start, verify it with Resemblyzer.
+                seg_word_count = len(seg_words)
+                is_short_segment = seg_word_count <= 4
+                is_start_segment = seg_idx == 0
+
+                should_merge_with_prev = False
+
+                if is_short_segment and is_start_segment and seg_speaker:
+                    try:
+                        # Get audio for this short segment
+                        audio_segment, (slice_start, slice_end) = slice_audio_window(
+                            ring, seg_words
+                        )
+                        if audio_segment is not None and len(audio_segment) > 0:
+                            # Verify with Resemblyzer
+                            diarized_label, similarity = diarizer.diarize(
+                                audio_segment,
+                                update_centroid=False,  # Don't update on verification
+                            )
+
+                            # If Resemblyzer strongly disagrees (high confidence different speaker),
+                            # trust Resemblyzer and correct the speaker
+                            if diarized_label and similarity >= 0.70:
+                                if diarized_label != seg_speaker:
+                                    print(
+                                        f"🔧 Correcting boundary: AssemblyAI={seg_speaker}, "
+                                        f"Resemblyzer={diarized_label} (sim={similarity:.3f}) for '{seg_text[:50]}'"
+                                    )
+                                    seg_speaker = diarized_label
+
+                                    # Check if corrected speaker matches previous segment (within transcript)
+                                    if (
+                                        prev_seg_speaker
+                                        and diarized_label == prev_seg_speaker
+                                    ):
+                                        should_merge_with_prev = True
+                                        print(
+                                            f"🔗 Merging '{seg_text[:50]}' with previous {prev_seg_speaker} segment (within transcript)"
+                                        )
+                                    # Check if corrected speaker matches last emitted speaker (cross-transcript)
+                                    elif (
+                                        last_emitted_speaker_global
+                                        and diarized_label
+                                        == last_emitted_speaker_global
+                                    ):
+                                        should_merge_with_prev = True
+                                        print(
+                                            f"🔗 Merging '{seg_text[:50]}' with previous {last_emitted_speaker_global} segment (cross-transcript)"
+                                        )
+                                        # Use previous segment info for merging
+                                        prev_seg_text = last_emitted_text_global
+                                        prev_seg_speaker = last_emitted_speaker_global
+                    except Exception as e:
+                        print(f"⚠ Boundary verification error: {e}")
 
                 # Step 2: If AssemblyAI didn't provide a speaker, use Resemblyzer as fallback
                 if not seg_speaker:
@@ -694,8 +763,27 @@ async def transcription_worker(audio_mode="microphone"):
                 if not seg_speaker:
                     seg_speaker = "Speaker"
 
-                # Emit this segment as a separate transcription with its speaker label
-                emit_transcription(seg_text, is_partial=False, speaker=seg_speaker)
+                # Step 4: Merge with previous segment if needed, otherwise emit
+                if should_merge_with_prev and prev_seg_text:
+                    # Merge: combine texts and emit as one
+                    merged_text = f"{prev_seg_text} {seg_text}".strip()
+                    emit_transcription(
+                        merged_text, is_partial=False, speaker=seg_speaker
+                    )
+                    # Update global tracking
+                    last_emitted_speaker_global = seg_speaker
+                    last_emitted_text_global = merged_text
+                    # Don't update prev_seg_* since we just emitted the merged version
+                    prev_seg_text = None
+                    prev_seg_speaker = None
+                else:
+                    # Emit this segment as a separate transcription with its speaker label
+                    emit_transcription(seg_text, is_partial=False, speaker=seg_speaker)
+                    # Update global and local tracking
+                    last_emitted_speaker_global = seg_speaker
+                    last_emitted_text_global = seg_text
+                    prev_seg_text = seg_text
+                    prev_seg_speaker = seg_speaker
         else:
             # ============================================================
             # CASE B: Single Speaker in Transcript
@@ -799,6 +887,10 @@ async def transcription_worker(audio_mode="microphone"):
             # Step 5: Emit the final transcript with the determined speaker label
             emit_transcription(transcript, is_partial=False, speaker=speaker_label)
 
+            # Update global tracking for boundary correction
+            last_emitted_speaker_global = speaker_label
+            last_emitted_text_global = transcript
+
     await aai_stream(audio_gen(), on_result)
 
 
@@ -855,6 +947,7 @@ def handle_start_recording(data=None):
     """Start transcription."""
     global is_recording, recording_thread, ring
     global emitted_text_hashes, recent_emitted_blocks, processed_final_transcripts, diarizer
+    global last_emitted_speaker_global, last_emitted_text_global
 
     audio_mode = "microphone"
     if data and isinstance(data, dict):
@@ -878,6 +971,10 @@ def handle_start_recording(data=None):
     recent_emitted_blocks = []
     processed_final_transcripts.clear()
     reset_api_speakers()
+
+    # Reset global tracking for boundary correction
+    last_emitted_speaker_global = None
+    last_emitted_text_global = None
 
     # Reset diarizer (start new session speakers)
     diarizer.reset()

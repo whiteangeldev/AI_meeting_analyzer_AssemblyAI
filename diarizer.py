@@ -190,13 +190,38 @@ class OnlineDiarizer:
             sim = 1.0 - cosine(centroid, emb)
             all_similarities[label] = sim
 
-        # If we already reached max_speakers → always reuse best match
+        # If we already reached max_speakers → check if we should still register new speaker
         if len(self.speakers) >= self.max_speakers:
-            # Use adaptive threshold: lower if we have both speakers to avoid creating third
-            # This helps when both speakers exist but similarity is borderline
-            adaptive_threshold = (
-                self.threshold - 0.05 if len(self.speakers) == 2 else self.threshold
-            )
+            # If best similarity is below threshold, it's clearly a new speaker
+            # Allow registration by replacing the least confident speaker
+            # Use threshold - 0.10 as replacement trigger (with 0.72 threshold, this is 0.62)
+            replacement_threshold = max(0.60, self.threshold - 0.10)
+            if best_sim < replacement_threshold:
+                # Find the speaker with the fewest samples (least confident)
+                least_confident = min(
+                    self.speakers.keys(),
+                    key=lambda l: len(self.histories.get(l, [])),
+                )
+                print(
+                    f"🔄 Replacing least confident speaker {least_confident} "
+                    f"(best_sim={best_sim:.3f} < {replacement_threshold:.2f}, clearly new speaker)"
+                )
+                # Remove the least confident speaker
+                del self.speakers[least_confident]
+                del self.histories[least_confident]
+                # Register new speaker
+                if update_centroid:
+                    label = self._register_speaker(
+                        emb, reason=f"replacing {least_confident}"
+                    )
+                    return label, best_sim
+                return None, best_sim
+
+            # Use adaptive threshold based on number of speakers
+            # More speakers = lower threshold needed (each speaker gets 0.02 reduction)
+            adaptive_threshold = self.threshold - (0.02 * (len(self.speakers) - 1))
+            adaptive_threshold = max(0.50, adaptive_threshold)  # Don't go below 0.50
+
             if best_sim >= adaptive_threshold:
                 if update_centroid and self._should_update(best_sim):
                     self._update_centroid(best_label, emb)
@@ -205,29 +230,40 @@ class OnlineDiarizer:
                         f"ℹ️  Skipping centroid update for {best_label} (sim={best_sim:.3f})"
                     )
             else:
-                # Log why we're not updating - helps debug
+                # Similarity too low - might be a new speaker but we're at max
+                # Log for debugging
                 print(
                     f"ℹ️  Low similarity for {best_label} (sim={best_sim:.3f} < {adaptive_threshold:.3f}), "
-                    f"all sims: {all_similarities}"
+                    f"but max_speakers reached. All sims: {all_similarities}"
                 )
             return best_label, best_sim
 
         # If best match is good enough → reuse that speaker
-        if best_sim >= self.threshold:
+        # Use adaptive threshold: slightly lower when we have fewer speakers, but keep it high
+        adaptive_match_threshold = self.threshold
+        if len(self.speakers) < self.max_speakers:
+            # Small reduction to help register new speakers, but keep threshold high
+            # With high base threshold (0.72), we only reduce slightly
+            reduction = 0.02 * (self.max_speakers - len(self.speakers))
+            adaptive_match_threshold = max(
+                0.65, self.threshold - reduction
+            )  # Keep minimum at 0.65
+
+        if best_sim >= adaptive_match_threshold:
             if update_centroid:
                 self._update_centroid(best_label, emb)
             return best_label, best_sim
 
         # Before creating new speaker, check requirements:
-        # 1. First speaker must have minimum samples
-        # 2. New speaker must be significantly different (confidence gap)
-        if len(self.speakers) == 1:
+        # 1. All existing speakers must have minimum samples (or at least the first one)
+        # 2. New speaker must be significantly different from ALL existing speakers
+        if len(self.speakers) > 0:
+            # Check minimum samples for first speaker
             first_speaker = list(self.speakers.keys())[0]
             first_samples = len(self.histories.get(first_speaker, []))
 
-            # Require minimum samples before allowing second speaker
             if first_samples < self.min_samples_before_new_speaker:
-                # Force match to first speaker even if below threshold
+                # Force match to first speaker
                 print(
                     f"ℹ️  Forcing match to {first_speaker} (only {first_samples} samples, "
                     f"need {self.min_samples_before_new_speaker}). Best sim: {best_sim:.3f}"
@@ -236,49 +272,57 @@ class OnlineDiarizer:
                     self._update_centroid(first_speaker, emb)
                 return first_speaker, best_sim
 
-            # Require confidence gap: new speaker must be significantly different
-            first_sim = all_similarities.get(first_speaker, 0.0)
-            gap = first_sim - best_sim
+            # Check confidence gap against ALL existing speakers, not just first
+            # New speaker must be significantly different from the closest existing speaker
+            closest_speaker = best_label
+            closest_sim = best_sim
 
-            # Adaptive gap logic:
-            # - If best_sim is well below threshold (< 0.60), it's clearly not User1
-            #   Allow User2 registration regardless of gap (skip gap check)
-            # - If best_sim is borderline (0.60-0.65), require gap to prevent false splits
-            # - If first_speaker is very confident (> 0.75), require larger gap
-            if best_sim < 0.60:
+            # Adaptive gap logic based on best similarity
+            # With higher base threshold, we can be more lenient here
+            # If similarity is below 0.70, it's clearly a different speaker
+            new_speaker_threshold = 0.70
+            if best_sim < new_speaker_threshold:
                 # Well below threshold - clearly different speaker, skip gap check
-                # This allows User2 to register even if gap is small
                 print(
-                    f"ℹ️  Allowing new speaker (best_sim={best_sim:.3f} < 0.60, "
-                    f"clearly different from {first_speaker} sim={first_sim:.3f})"
+                    f"ℹ️  Allowing new speaker (best_sim={best_sim:.3f} < {new_speaker_threshold:.2f}, "
+                    f"clearly different from {closest_speaker} sim={closest_sim:.3f})"
                 )
-            elif first_sim > 0.75:
-                # First speaker is very confident, require larger gap to prevent false splits
+                # Skip the rest of the gap checks and proceed to registration
+                # (fall through to line 300)
+            elif closest_sim > 0.75:
+                # Closest speaker is very confident, require larger gap
                 adaptive_gap = self.confidence_gap * 1.5
-                if best_sim > first_sim - adaptive_gap:
+                gap = closest_sim - best_sim
+                if best_sim > closest_sim - adaptive_gap:
                     print(
-                        f"ℹ️  Too similar to {first_speaker} (sim={first_sim:.3f} vs best={best_sim:.3f}, "
+                        f"ℹ️  Too similar to {closest_speaker} (sim={closest_sim:.3f} vs best={best_sim:.3f}, "
                         f"gap={gap:.3f} < {adaptive_gap:.3f}). Forcing match."
                     )
                     if update_centroid:
-                        self._update_centroid(first_speaker, emb)
-                    return first_speaker, best_sim
+                        self._update_centroid(closest_speaker, emb)
+                    return closest_speaker, best_sim
             else:
                 # Standard case - require normal confidence gap
                 adaptive_gap = self.confidence_gap
-                if best_sim > first_sim - adaptive_gap:
+                gap = closest_sim - best_sim
+                if best_sim > closest_sim - adaptive_gap:
                     print(
-                        f"ℹ️  Too similar to {first_speaker} (sim={first_sim:.3f} vs best={best_sim:.3f}, "
+                        f"ℹ️  Too similar to {closest_speaker} (sim={closest_sim:.3f} vs best={best_sim:.3f}, "
                         f"gap={gap:.3f} < {adaptive_gap:.3f}). Forcing match."
                     )
                     if update_centroid:
-                        self._update_centroid(first_speaker, emb)
-                    return first_speaker, best_sim
+                        self._update_centroid(closest_speaker, emb)
+                    return closest_speaker, best_sim
 
         # All checks passed - create a new speaker (within max_speakers limit)
         if update_centroid:
             label = self._register_speaker(
                 emb, reason=f"sim={best_sim:.3f}, below threshold"
             )
+            print(f"✅ Successfully registered {label} with similarity {best_sim:.3f}")
             return label, best_sim
+        else:
+            print(
+                f"⚠️  Would register new speaker but update_centroid=False (sim={best_sim:.3f})"
+            )
         return None, best_sim
