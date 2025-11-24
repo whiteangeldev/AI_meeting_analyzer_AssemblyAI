@@ -334,9 +334,9 @@ def try_split_long_transcript(words, ring, diarizer, transcript_text):
     Returns:
         List of (start_idx, end_idx, speaker_label) segments, or None if can't split
     """
-    if not words or len(words) < 30:  # Only try for transcripts with 30+ words
+    if not words or len(words) < 15:  # More aggressive: 15+ words
         return None
-
+    print("===============Why is this needed?============")
     # Get time bounds
     bounds = _word_time_bounds(words)
     if not bounds:
@@ -345,19 +345,25 @@ def try_split_long_transcript(words, ring, diarizer, transcript_text):
     start_s, end_s = bounds
     duration = end_s - start_s
 
-    # Only try if transcript is longer than 8 seconds
-    if duration < 8.0:
+    # Lower duration requirement: 4 seconds (more aggressive splitting)
+    if duration < 4.0:
         return None
 
-    # Split into 4-5 second chunks and analyze each
-    chunk_duration = 4.5
+    # Use overlapping chunks for better speaker change detection
+    # Even smaller chunks (1.5 seconds) with 0.5 second overlap for finer detection
+    chunk_duration = 1.5
+    chunk_overlap = 0.5  # 0.5 second overlap between chunks
+    chunk_step = chunk_duration - chunk_overlap  # 1 second step
+
     segments = []
     current_chunk_start_idx = 0
     current_chunk_start_time = start_s
     last_speaker = None
+    last_speaker_similarity = 0.0
 
-    for chunk_idx in range(int(duration / chunk_duration) + 1):
-        chunk_start_time = start_s + chunk_idx * chunk_duration
+    num_chunks = int((duration - chunk_overlap) / chunk_step) + 1
+    for chunk_idx in range(num_chunks):
+        chunk_start_time = start_s + chunk_idx * chunk_step
         chunk_end_time = min(end_s, chunk_start_time + chunk_duration)
 
         if chunk_end_time <= chunk_start_time:
@@ -386,28 +392,167 @@ def try_split_long_transcript(words, ring, diarizer, transcript_text):
         try:
             audio_segment, _ = slice_audio_window(ring, chunk_words)
             if audio_segment is not None and len(audio_segment) > 0:
-                # Run diarization (don't update centroids to avoid contamination)
+                # CRITICAL: Use update_centroid=True to actually learn speakers during splitting
+                # This is essential - if we don't register speakers during the first transcript,
+                # we'll never learn their voice characteristics and can't distinguish them later
+                # First pass: try to match existing speakers
                 speaker_label, similarity = diarizer.diarize(
-                    audio_segment, update_centroid=False
+                    audio_segment, update_centroid=True
                 )
 
-                if speaker_label and similarity >= 0.50:
+                # Get all speaker similarities to detect ambiguous matches
+                # If similarity is close to multiple speakers, it's likely a new speaker
+                is_ambiguous = False
+                all_similarities = {}
+                if (
+                    hasattr(diarizer, "speakers")
+                    and diarizer.speakers
+                    and len(diarizer.speakers) > 0
+                ):
+                    try:
+                        from scipy.spatial.distance import cosine
+                        import numpy as np
+
+                        # Get embedding for this chunk
+                        emb = diarizer.encoder.embed_utterance(
+                            audio_segment.astype(np.float32)
+                        )
+                        emb = emb / (np.linalg.norm(emb) + 1e-9)
+
+                        for label, centroid in diarizer.speakers.items():
+                            sim = 1.0 - cosine(centroid, emb)
+                            all_similarities[label] = sim
+
+                        # Check if top 2 similarities are close (within 0.08) - indicates ambiguity
+                        if len(all_similarities) >= 2:
+                            sorted_sims = sorted(
+                                all_similarities.values(), reverse=True
+                            )
+                            is_ambiguous = (
+                                sorted_sims[0] - sorted_sims[1] < 0.08
+                                and sorted_sims[0] < 0.75
+                            )  # Not very confident
+
+                        # If no speaker was returned but we have existing speakers,
+                        # check if similarity to all is very low - likely a new speaker
+                        if (
+                            speaker_label is None
+                            and len(diarizer.speakers) < diarizer.max_speakers
+                        ):
+                            max_sim = (
+                                max(all_similarities.values())
+                                if all_similarities
+                                else -1
+                            )
+                            if (
+                                max_sim < 0.50
+                            ):  # Very low similarity to all existing speakers
+                                # Force registration of new speaker
+                                print(
+                                    f"🔍 Split: Very low similarity ({max_sim:.3f}) to all speakers, forcing new speaker registration"
+                                )
+                                speaker_label, similarity = diarizer.diarize(
+                                    audio_segment, update_centroid=True
+                                )
+                                # If still None, it means we're at max_speakers or other constraint
+                                if speaker_label is None:
+                                    # Use the least similar existing speaker as fallback
+                                    min_sim_label = min(
+                                        all_similarities.items(), key=lambda x: x[1]
+                                    )[0]
+                                    speaker_label = min_sim_label
+                                    similarity = all_similarities[min_sim_label]
+                                    print(
+                                        f"🔍 Split: Using least similar existing speaker: {speaker_label} (sim={similarity:.3f})"
+                                    )
+                    except Exception as e:
+                        # If embedding fails, continue without ambiguity check
+                        print(f"⚠ Error computing similarities: {e}")
+                        pass
+
+                # More sensitive diarization for splitting:
+                # 1. Detect significant similarity drops (indicates speaker change)
+                # 2. Detect when same label has very low similarity (might be wrong match)
+                # 3. Detect ambiguous matches (close to multiple speakers = likely new speaker)
+                # 4. Very low similarity (< 0.50) always indicates a speaker change
+                similarity_dropped = (
+                    last_speaker is not None
+                    and similarity < last_speaker_similarity - 0.10
+                )
+                low_confidence_match = (
+                    speaker_label == last_speaker
+                    and similarity < 0.60
+                    and last_speaker_similarity > 0.70
+                )
+                very_low_similarity = (
+                    similarity < 0.50
+                )  # Very low = likely different speaker
+
+                # Very sensitive threshold for splitting - detect ANY speaker change
+                # Accept any diarization result (even low similarity) to catch all speakers
+                # During the first transcript, it's critical to learn all speakers correctly
+                if speaker_label:
                     # Check if speaker changed
                     if last_speaker is None:
                         last_speaker = speaker_label
+                        last_speaker_similarity = similarity
                         current_chunk_start_idx = chunk_word_indices[0]
-                    elif speaker_label != last_speaker:
-                        # Speaker changed - save previous segment
-                        segments.append(
-                            (
-                                current_chunk_start_idx,
-                                chunk_word_indices[0],
-                                last_speaker,
-                            )
+                        print(
+                            f"🔍 Split: First speaker detected: {speaker_label} (sim={similarity:.3f})"
                         )
+                    elif (
+                        speaker_label != last_speaker
+                        or low_confidence_match
+                        or is_ambiguous
+                        or very_low_similarity  # Very low similarity = likely different speaker
+                        or similarity_dropped  # Significant drop = speaker change
+                    ):
+                        # Speaker changed - log for debugging
+                        if speaker_label != last_speaker:
+                            print(
+                                f"🔍 Split: Speaker changed {last_speaker} → {speaker_label} (sim={similarity:.3f})"
+                            )
+                        elif very_low_similarity:
+                            print(
+                                f"🔍 Split: Very low similarity ({similarity:.3f}) for {speaker_label}, treating as speaker change"
+                            )
+                        elif similarity_dropped:
+                            print(
+                                f"🔍 Split: Similarity dropped ({last_speaker_similarity:.3f} → {similarity:.3f}), treating as speaker change"
+                            )
+                        # Speaker changed (different label OR low confidence OR ambiguous match)
+                        # Use midpoint between chunks as boundary for more accurate splitting
+                        boundary_idx = (
+                            current_chunk_start_idx + chunk_word_indices[0]
+                        ) // 2
+                        # Only add segment if it has meaningful content (at least 3 words)
+                        if boundary_idx - current_chunk_start_idx >= 3 and last_speaker:
+                            segments.append(
+                                (
+                                    current_chunk_start_idx,
+                                    boundary_idx,
+                                    last_speaker,
+                                )
+                            )
                         # Start new segment
-                        last_speaker = speaker_label
-                        current_chunk_start_idx = chunk_word_indices[0]
+                        # If ambiguous and low similarity, treat as potential new speaker
+                        if is_ambiguous and similarity < 0.65:
+                            # Very ambiguous - treat as new speaker segment
+                            # Will be diarized properly when segment is processed
+                            last_speaker = (
+                                speaker_label  # Use current label but mark as uncertain
+                            )
+                            last_speaker_similarity = similarity
+                            current_chunk_start_idx = boundary_idx
+                        else:
+                            last_speaker = speaker_label
+                            last_speaker_similarity = similarity
+                            current_chunk_start_idx = boundary_idx
+                    else:
+                        # Same speaker with good confidence, update similarity
+                        last_speaker_similarity = max(
+                            last_speaker_similarity, similarity
+                        )
         except Exception as e:
             print(f"⚠ Error analyzing chunk for splitting: {e}")
             continue
@@ -612,7 +757,17 @@ async def transcription_worker(audio_mode="microphone"):
         )
 
         # Step 2b: If no speaker boundaries detected but transcript is long, try fallback splitting
-        if not has_multiple_speakers and len(words) >= 30:
+        # More aggressive: try splitting for 15+ words OR if transcript is 4+ seconds
+        should_try_split = len(words) >= 15
+        if not should_try_split and len(words) >= 8:
+            # Check duration - if transcript is 4+ seconds, it might have multiple speakers
+            bounds = _word_time_bounds(words)
+            if bounds:
+                duration = bounds[1] - bounds[0]
+                if duration >= 4.0:
+                    should_try_split = True
+
+        if not has_multiple_speakers and should_try_split:
             fallback_segments = try_split_long_transcript(
                 words, ring, diarizer, transcript
             )
@@ -689,7 +844,8 @@ async def transcription_worker(audio_mode="microphone"):
 
                             # If Resemblyzer strongly disagrees (high confidence different speaker),
                             # trust Resemblyzer and correct the speaker
-                            if diarized_label and similarity >= 0.70:
+                            # Lower threshold for boundary correction to catch more speaker changes
+                            if diarized_label and similarity >= 0.65:
                                 if diarized_label != seg_speaker:
                                     print(
                                         f"🔧 Correcting boundary: AssemblyAI={seg_speaker}, "

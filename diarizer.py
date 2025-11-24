@@ -239,17 +239,37 @@ class OnlineDiarizer:
             return best_label, best_sim
 
         # If best match is good enough → reuse that speaker
-        # Use adaptive threshold: slightly lower when we have fewer speakers, but keep it high
-        adaptive_match_threshold = self.threshold
-        if len(self.speakers) < self.max_speakers:
-            # Small reduction to help register new speakers, but keep threshold high
-            # With high base threshold (0.72), we only reduce slightly
-            reduction = 0.02 * (self.max_speakers - len(self.speakers))
-            adaptive_match_threshold = max(
-                0.65, self.threshold - reduction
-            )  # Keep minimum at 0.65
+        # Keep threshold strict (0.72) - no adaptive reduction to avoid false matches
+        # However, if similarity is in borderline zone (0.65-0.80) and we have room for more speakers,
+        # register a new speaker instead of matching (helps distinguish similar voices)
+        # Wider zone to catch more cases where voices are similar but different
+        borderline_low = 0.65
+        borderline_high = 0.80
 
-        if best_sim >= adaptive_match_threshold:
+        # Use higher threshold (0.80) for clear matches - only very confident matches
+        # Everything below 0.80 will be in borderline zone and register as new speaker if we have room
+        clear_match_threshold = 0.80
+
+        if best_sim >= clear_match_threshold:
+            # Very clear match - above 0.80 (very confident)
+            if update_centroid:
+                self._update_centroid(best_label, emb)
+            return best_label, best_sim
+        elif (
+            best_sim >= borderline_low
+            and best_sim < borderline_high
+            and len(self.speakers) < self.max_speakers
+        ):
+            # Borderline zone: similarity is 0.65-0.80
+            # If we have room for more speakers, register new speaker instead of matching
+            # This helps distinguish voices that are similar but different
+            print(
+                f"🔍 Borderline similarity (sim={best_sim:.3f} in {borderline_low:.2f}-{borderline_high:.2f}), "
+                f"registering new speaker instead of matching {best_label} (have {len(self.speakers)}/{self.max_speakers} speakers)"
+            )
+            # Fall through to registration logic below
+        elif best_sim >= borderline_low:
+            # Above borderline high but we're at max speakers - match existing
             if update_centroid:
                 self._update_centroid(best_label, emb)
             return best_label, best_sim
@@ -279,14 +299,26 @@ class OnlineDiarizer:
 
             # Adaptive gap logic based on best similarity
             # With higher base threshold, we can be more lenient here
-            # If similarity is below 0.70, it's clearly a different speaker
-            new_speaker_threshold = 0.70
-            if best_sim < new_speaker_threshold:
-                # Well below threshold - clearly different speaker, skip gap check
-                print(
-                    f"ℹ️  Allowing new speaker (best_sim={best_sim:.3f} < {new_speaker_threshold:.2f}, "
-                    f"clearly different from {closest_speaker} sim={closest_sim:.3f})"
-                )
+            # If similarity is below 0.65, it's clearly a different speaker
+            # If similarity is 0.65-0.80 (borderline) and we have room, also allow
+            new_speaker_threshold = 0.65
+            is_borderline = (
+                borderline_low <= best_sim < borderline_high
+                and len(self.speakers) < self.max_speakers
+            )
+
+            if best_sim < new_speaker_threshold or is_borderline:
+                # Well below threshold OR in borderline zone with room - allow new speaker
+                if is_borderline:
+                    print(
+                        f"ℹ️  Allowing new speaker (borderline: sim={best_sim:.3f} in {borderline_low:.2f}-{borderline_high:.2f}, "
+                        f"different from {closest_speaker} sim={closest_sim:.3f})"
+                    )
+                else:
+                    print(
+                        f"ℹ️  Allowing new speaker (best_sim={best_sim:.3f} < {new_speaker_threshold:.2f}, "
+                        f"clearly different from {closest_speaker} sim={closest_sim:.3f})"
+                    )
                 # Skip the rest of the gap checks and proceed to registration
                 # (fall through to line 300)
             elif closest_sim > 0.75:
